@@ -4,6 +4,8 @@ import collections
 import math
 import statistics
 import time
+
+import numpy as np
 import spidev, RPi.GPIO as GPIO
 import matplotlib
 matplotlib.use('TkAgg')
@@ -277,7 +279,7 @@ def update(_):
             ys.append(peak_rms)
             ids.append(eid)
 
-    levents.set_offsets(list(zip(xs, ys)) if xs else [])
+    levents.set_offsets(np.column_stack((xs, ys)) if xs else np.empty((0, 2)))
 
     # Rebuild text labels each frame (small count; keeps logic simple)
     for t in event_texts:
