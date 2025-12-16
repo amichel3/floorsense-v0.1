@@ -2,6 +2,7 @@
 import argparse
 import collections
 import math
+import statistics
 import time
 import spidev, RPi.GPIO as GPIO
 import matplotlib
@@ -69,6 +70,10 @@ parser.add_argument("--rms-ms", type=float, default=10.0, help="RMS window lengt
 parser.add_argument("--mean-sec", type=float, default=0.5, help="Moving mean window seconds for detrend (default 0.5)")
 parser.add_argument("--glitch-abs", type=int, default=GLITCH_ABS_COUNTS_DEFAULT, help="Reject samples with abs(counts) >= this")
 parser.add_argument("--no-glitch-reject", action="store_true", help="Disable glitch rejection (useful to confirm clipping)")
+parser.add_argument("--score", action="store_true", help="Print simple event score (RMS/baseline) once per interval")
+parser.add_argument("--score-interval", type=float, default=1.0, help="Seconds between score prints (default 1.0)")
+parser.add_argument("--score-window-sec", type=float, default=0.25, help="Window seconds for current RMS stats (default 0.25)")
+parser.add_argument("--score-baseline-sec", type=float, default=2.0, help="Window seconds for baseline RMS stats (default 2.0)")
 args = parser.parse_args()
 
 # --- Setup GPIO + SPI ---
@@ -148,9 +153,11 @@ glitch_count = 0
 clip_count = 0
 last_good = None
 
+last_score_t = 0.0
+
 CHUNK=20   # ~20 ms/frame
 def update(_):
-    global glitch_count, clip_count, last_good
+    global glitch_count, clip_count, last_good, last_score_t
     for _ in range(CHUNK):
         v  = read_sample()
 
@@ -170,6 +177,25 @@ def update(_):
         buf_raw.append(vr)
         buf_bp.append(vf)
         buf_rms.append(vlo)
+
+    if args.score and (time.time() - last_score_t) >= max(0.1, args.score_interval):
+        last_score_t = time.time()
+        rms_list = list(buf_rms)
+        n_cur = max(1, int(args.score_window_sec * FS))
+        n_base = max(1, int(args.score_baseline_sec * FS))
+
+        cur = rms_list[-n_cur:]
+        base = rms_list[-n_base:]
+
+        cur_mean = sum(cur) / len(cur)
+        cur_peak = max(cur) if cur else 0.0
+        base_med = statistics.median(base) if base else 0.0
+        ratio = (cur_mean / base_med) if base_med > 0 else float('inf')
+
+        print(
+            f"score cur_mean={cur_mean:.2f} cur_peak={cur_peak:.2f} baseline_med={base_med:.2f} ratio={ratio:.2f}",
+            flush=True,
+        )
 
     y1=list(buf_raw); y2=list(buf_bp); y3=list(buf_rms)
     lr.set_ydata(y1)
