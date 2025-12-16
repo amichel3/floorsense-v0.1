@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-import time, math, collections
+import argparse
+import collections
+import math
+import time
 import spidev, RPi.GPIO as GPIO
 import matplotlib
 matplotlib.use('TkAgg')
@@ -7,7 +10,10 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 # Pins
-DRDY_PIN = 17  # BCM (pin 11)
+DRDY_PIN_DEFAULT = 17  # BCM (physical pin 11)
+
+FULL_SCALE_COUNTS = (1 << 23) - 1
+GLITCH_ABS_COUNTS_DEFAULT = int(0.98 * FULL_SCALE_COUNTS)
 
 # ADS1256 commands/registers
 CMD_RESET=0xFE; CMD_WREG=0x50; CMD_RDATA=0x01; CMD_SDATAC=0x0F
@@ -27,23 +33,59 @@ def wait_drdy(timeout=0.5):
         time.sleep(0.0002)
     raise TimeoutError("DRDY timeout")
 
+
+def mux_from_mode(mode: str) -> int:
+    # ADS1256 MUX: high nibble = positive input, low nibble = negative input.
+    # 0x18 = AIN1 - AINCOM (single-ended)
+    # 0x08 = AIN0 - AINCOM (single-ended)
+    # 0x01 = AIN0 - AIN1  (differential)
+    mode = mode.lower().strip()
+    if mode in {"ain1_gnd", "ain1_aincom", "ch1"}:
+        return 0x18
+    if mode in {"ain0_gnd", "ain0_aincom", "ch0"}:
+        return 0x08
+    if mode in {"ain0_ain1", "diff01", "diff"}:
+        return 0x01
+    raise ValueError(f"unknown --input-mode '{mode}'")
+
+
+def adcon_from_pga(pga: int) -> int:
+    # ADS1256 ADCON: lower 3 bits set PGA: 1,2,4,8,16,32,64
+    pga_map = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4, 32: 5, 64: 6}
+    if pga not in pga_map:
+        raise ValueError("PGA must be one of: 1,2,4,8,16,32,64")
+    return pga_map[pga]
+
+
+parser = argparse.ArgumentParser(description="ADS1256 DRDY-synchronized plot with band-pass + RMS")
+parser.add_argument("--drdy-pin", type=int, default=DRDY_PIN_DEFAULT, help="BCM pin for DRDY (default: 17)")
+parser.add_argument("--input-mode", type=str, default="ain1_gnd", help="ain1_gnd | ain0_gnd | ain0_ain1")
+parser.add_argument("--pga", type=int, default=1, help="ADC PGA gain: 1,2,4,8,16,32,64")
+parser.add_argument("--sps", type=float, default=1000.0, help="Assumed sample rate for filters/plot scaling (default 1000)")
+parser.add_argument("--hp", type=float, default=5.0, help="High-pass cutoff Hz (default 5)")
+parser.add_argument("--lp", type=float, default=50.0, help="Low-pass cutoff Hz (default 50)")
+parser.add_argument("--rms-ms", type=float, default=10.0, help="RMS window length in ms (default 10)")
+parser.add_argument("--mean-sec", type=float, default=0.5, help="Moving mean window seconds for detrend (default 0.5)")
+parser.add_argument("--glitch-abs", type=int, default=GLITCH_ABS_COUNTS_DEFAULT, help="Reject samples with abs(counts) >= this")
+args = parser.parse_args()
+
 # --- Setup GPIO + SPI ---
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(DRDY_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(args.drdy_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 s=spidev.SpiDev(); s.open(0,0); s.max_speed_hz=1_000_000; s.mode=0b01
 s.xfer2([CMD_RESET]); time.sleep(0.05); s.xfer2([CMD_SDATAC]); time.sleep(0.001)
 wr(s,REG_STATUS,0x03)   # MSB-first, BUFEN=1
-wr(s,REG_MUX,   0x18)   # AIN1 vs GND (use 0x08 if you're on AIN0)
-wr(s,REG_ADCON, 0x00)   # PGA=1
+wr(s,REG_MUX,   mux_from_mode(args.input_mode))
+wr(s,REG_ADCON, adcon_from_pga(args.pga))
 wr(s,REG_DRATE, 0xA1)   # ~1000 SPS
 s.xfer2([CMD_SELFCAL]); time.sleep(0.1)
 s.xfer2([CMD_SYNC]); time.sleep(0.001); s.xfer2([CMD_WAKEUP]); time.sleep(0.001)
 
-# --- Filters: 5–50 Hz band-pass (first-order HPF + LPF) ---
-FS = 1000.0
-F_HP = 5.0
-F_LP = 50.0
+# --- Filters: band-pass (first-order HPF + LPF) ---
+FS = float(args.sps)
+F_HP = float(args.hp)
+F_LP = float(args.lp)
 a_hp = math.exp(-2.0*math.pi*F_HP/FS); x1=0.0; y1=0.0
 a_lp = math.exp(-2.0*math.pi*F_LP/FS); yl1=0.0
 def bandpass_step(sample):
@@ -53,7 +95,7 @@ def bandpass_step(sample):
     return yl
 
 # Detrend raw (center around 0)
-MEAN_WIN = int(0.5*FS)  # 0.5 s moving mean
+MEAN_WIN = max(1, int(float(args.mean_sec) * FS))
 from collections import deque
 mwin = deque(); msum=0.0
 def detrend(v):
@@ -65,8 +107,7 @@ def detrend(v):
     return v - mean
 
 # --- Moving RMS smoother for filtered signal ---
-# Set window between 5–20 ms. Default 10 ms:
-RMS_MS = 10.0
+RMS_MS = float(args.rms_ms)
 RMS_N = max(1, int(FS * RMS_MS / 1000.0))
 rwin = deque(); rsum_sq = 0.0
 def rms_smooth(x):
@@ -89,7 +130,7 @@ plt.style.use("seaborn-v0_8-darkgrid")
 fig,(ax1,ax2)=plt.subplots(2,1,figsize=(10,6),sharex=True)
 lr, = ax1.plot(range(N), list(buf_raw), lw=1.0, color="#1f77b4", label="raw (detrended)")
 ax1.set_ylabel("Counts"); ax1.legend(loc="upper left")
-lf, = ax2.plot(range(N), list(buf_bp),  lw=1.0, color="#d62728", alpha=0.6, label="band-pass 5–50 Hz")
+lf, = ax2.plot(range(N), list(buf_bp),  lw=1.0, color="#d62728", alpha=0.6, label=f"band-pass {F_HP:g}–{F_LP:g} Hz")
 lrms,= ax2.plot(range(N), list(buf_rms),lw=1.6, color="#ff7f0e", label=f"RMS {int(RMS_MS)} ms")
 ax2.set_xlabel("Samples (last ~2 s)"); ax2.set_ylabel("Filtered"); ax2.legend(loc="upper left")
 
@@ -100,10 +141,22 @@ def read_sample():
     b0,b1,b2 = s.readbytes(3)
     return to_i24(b0,b1,b2)
 
+
+glitch_count = 0
+last_good = 0
+
 CHUNK=20   # ~20 ms/frame
 def update(_):
+    global glitch_count, last_good
     for _ in range(CHUNK):
         v  = read_sample()
+
+        if abs(v) >= args.glitch_abs:
+            glitch_count += 1
+            v = last_good
+        else:
+            last_good = v
+
         vr = detrend(v)
         vf = bandpass_step(vr)
         vlo = rms_smooth(vf)
@@ -121,6 +174,8 @@ def update(_):
     # ensure RMS trace is also in view
     ymin2=min(min(y2),min(y3)); ymax2=max(max(y2),max(y3)); margin2=0.1*max(1,ymax2-ymin2)
     ax2.set_ylim(ymin2-margin2, ymax2+margin2)
+
+    fig.suptitle(f"DRDY=on | input={args.input_mode} | PGA={args.pga} | glitches={glitch_count}")
     return lr, lf, lrms
 
 ani = animation.FuncAnimation(fig, update, interval=20, blit=False)
