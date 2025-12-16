@@ -77,6 +77,8 @@ parser.add_argument("--score-baseline-sec", type=float, default=2.0, help="Windo
 parser.add_argument("--event", action="store_true", help="Count events when ratio_peak crosses a threshold")
 parser.add_argument("--event-threshold", type=float, default=3.0, help="Trigger threshold on ratio_peak (default 3.0)")
 parser.add_argument("--event-min-interval", type=float, default=0.5, help="Minimum seconds between events (default 0.5)")
+parser.add_argument("--event-reset-threshold", type=float, default=1.5, help="Reset threshold on ratio_peak to end an event (default 1.5)")
+parser.add_argument("--event-reset-hold", type=float, default=0.25, help="Seconds ratio_peak must stay below reset threshold to end an event (default 0.25)")
 args = parser.parse_args()
 
 # --- Setup GPIO + SPI ---
@@ -142,6 +144,7 @@ lr, = ax1.plot(range(N), list(buf_raw), lw=1.0, color="#1f77b4", label="raw (det
 ax1.set_ylabel("Counts"); ax1.legend(loc="upper left")
 lf, = ax2.plot(range(N), list(buf_bp),  lw=1.0, color="#d62728", alpha=0.6, label=f"band-pass {F_HP:g}–{F_LP:g} Hz")
 lrms,= ax2.plot(range(N), list(buf_rms),lw=1.6, color="#ff7f0e", label=f"RMS {int(RMS_MS)} ms")
+levents = ax2.scatter([], [], marker='s', color='red', s=36, zorder=6)
 ax2.set_xlabel("Samples (last ~2 s)"); ax2.set_ylabel("Filtered"); ax2.legend(loc="upper left")
 
 def read_sample():
@@ -157,12 +160,27 @@ clip_count = 0
 last_good = None
 
 last_score_t = 0.0
-last_event_t = 0.0
 event_count = 0
+
+# Event grouping state (hysteresis)
+in_event = False
+event_peak_ratio = 0.0
+event_peak_rms = 0.0
+event_peak_index = 0
+event_below_since = None
+last_event_end_t = 0.0
+
+# Track absolute sample index for plotting markers in the rolling window
+sample_count = 0
+
+event_markers = collections.deque(maxlen=200)  # (sample_index, event_id, peak_rms, peak_ratio)
+event_texts = []
 
 CHUNK=20   # ~20 ms/frame
 def update(_):
-    global glitch_count, clip_count, last_good, last_score_t, last_event_t, event_count
+    global glitch_count, clip_count, last_good, last_score_t, event_count
+    global in_event, event_peak_ratio, event_peak_rms, event_peak_index, event_below_since, last_event_end_t
+    global sample_count, event_texts
     for _ in range(CHUNK):
         v  = read_sample()
 
@@ -182,6 +200,7 @@ def update(_):
         buf_raw.append(vr)
         buf_bp.append(vf)
         buf_rms.append(vlo)
+        sample_count += 1
 
     # --- Score + event detection (shared computation) ---
     rms_list = list(buf_rms)
@@ -215,13 +234,60 @@ def update(_):
 
     if args.event and baseline_ready:
         now = time.time()
-        if (ratio_peak >= float(args.event_threshold)) and (now - last_event_t >= float(args.event_min_interval)):
-            event_count += 1
-            last_event_t = now
-            print(
-                f"EVENT {event_count} ratio_peak={ratio_peak:.2f} ratio_mean={ratio_mean:.2f}",
-                flush=True,
-            )
+
+        if not in_event:
+            if (ratio_peak >= float(args.event_threshold)) and (now - last_event_end_t >= float(args.event_min_interval)):
+                in_event = True
+                event_peak_ratio = ratio_peak
+                event_peak_rms = cur_peak
+                event_peak_index = max(0, sample_count - 1)
+                event_below_since = None
+        else:
+            # Track the strongest point during the event
+            if ratio_peak >= event_peak_ratio:
+                event_peak_ratio = ratio_peak
+                event_peak_rms = cur_peak
+                event_peak_index = max(0, sample_count - 1)
+
+            # End event once ratio has been low for long enough
+            if ratio_peak <= float(args.event_reset_threshold):
+                if event_below_since is None:
+                    event_below_since = now
+                elif (now - event_below_since) >= float(args.event_reset_hold):
+                    event_count += 1
+                    last_event_end_t = now
+                    event_markers.append((event_peak_index, event_count, event_peak_rms, event_peak_ratio))
+                    print(
+                        f"EVENT {event_count} peak_ratio={event_peak_ratio:.2f} peak_rms={event_peak_rms:.2f}",
+                        flush=True,
+                    )
+                    in_event = False
+                    event_below_since = None
+            else:
+                event_below_since = None
+
+    # --- Render event markers in the current window ---
+    window_start = max(0, sample_count - N)
+    xs = []
+    ys = []
+    ids = []
+    for idx, eid, peak_rms, peak_ratio in list(event_markers):
+        if window_start <= idx < sample_count:
+            xs.append(idx - window_start)
+            ys.append(peak_rms)
+            ids.append(eid)
+
+    levents.set_offsets(list(zip(xs, ys)) if xs else [])
+
+    # Rebuild text labels each frame (small count; keeps logic simple)
+    for t in event_texts:
+        try:
+            t.remove()
+        except Exception:
+            pass
+    event_texts = []
+    for x, y, eid in zip(xs, ys, ids):
+        event_texts.append(ax2.text(x, y, str(eid), color='red', fontsize=9, ha='center', va='bottom'))
 
     y1=list(buf_raw); y2=list(buf_bp); y3=list(buf_rms)
     lr.set_ydata(y1)
