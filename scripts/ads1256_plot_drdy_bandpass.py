@@ -68,6 +68,7 @@ parser.add_argument("--lp", type=float, default=50.0, help="Low-pass cutoff Hz (
 parser.add_argument("--rms-ms", type=float, default=10.0, help="RMS window length in ms (default 10)")
 parser.add_argument("--mean-sec", type=float, default=0.5, help="Moving mean window seconds for detrend (default 0.5)")
 parser.add_argument("--glitch-abs", type=int, default=GLITCH_ABS_COUNTS_DEFAULT, help="Reject samples with abs(counts) >= this")
+parser.add_argument("--no-glitch-reject", action="store_true", help="Disable glitch rejection (useful to confirm clipping)")
 args = parser.parse_args()
 
 # --- Setup GPIO + SPI ---
@@ -144,17 +145,22 @@ def read_sample():
 
 
 glitch_count = 0
-last_good = 0
+clip_count = 0
+last_good = None
 
 CHUNK=20   # ~20 ms/frame
 def update(_):
-    global glitch_count, last_good
+    global glitch_count, clip_count, last_good
     for _ in range(CHUNK):
         v  = read_sample()
 
+        if abs(v) >= FULL_SCALE_COUNTS:
+            clip_count += 1
+
         if abs(v) >= args.glitch_abs:
             glitch_count += 1
-            v = last_good
+            if (not args.no_glitch_reject) and (last_good is not None):
+                v = last_good
         else:
             last_good = v
 
@@ -176,7 +182,10 @@ def update(_):
     ymin2=min(min(y2),min(y3)); ymax2=max(max(y2),max(y3)); margin2=0.1*max(1,ymax2-ymin2)
     ax2.set_ylim(ymin2-margin2, ymax2+margin2)
 
-    fig.suptitle(f"DRDY=on | input={args.input_mode} | PGA={args.pga} | glitches={glitch_count}")
+    fig.suptitle(
+        f"DRDY=on | input={args.input_mode} | PGA={args.pga} | clip={clip_count} | glitches={glitch_count}"
+        + (" | glitch-reject=off" if args.no_glitch_reject else "")
+    )
     return lr, lf, lrms
 
 ani = animation.FuncAnimation(fig, update, interval=20, blit=False)
