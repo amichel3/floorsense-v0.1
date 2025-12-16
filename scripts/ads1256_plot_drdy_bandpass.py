@@ -74,6 +74,9 @@ parser.add_argument("--score", action="store_true", help="Print simple event sco
 parser.add_argument("--score-interval", type=float, default=1.0, help="Seconds between score prints (default 1.0)")
 parser.add_argument("--score-window-sec", type=float, default=0.25, help="Window seconds for current RMS stats (default 0.25)")
 parser.add_argument("--score-baseline-sec", type=float, default=2.0, help="Window seconds for baseline RMS stats (default 2.0)")
+parser.add_argument("--event", action="store_true", help="Count events when ratio_peak crosses a threshold")
+parser.add_argument("--event-threshold", type=float, default=3.0, help="Trigger threshold on ratio_peak (default 3.0)")
+parser.add_argument("--event-min-interval", type=float, default=0.5, help="Minimum seconds between events (default 0.5)")
 args = parser.parse_args()
 
 # --- Setup GPIO + SPI ---
@@ -154,10 +157,12 @@ clip_count = 0
 last_good = None
 
 last_score_t = 0.0
+last_event_t = 0.0
+event_count = 0
 
 CHUNK=20   # ~20 ms/frame
 def update(_):
-    global glitch_count, clip_count, last_good, last_score_t
+    global glitch_count, clip_count, last_good, last_score_t, last_event_t, event_count
     for _ in range(CHUNK):
         v  = read_sample()
 
@@ -178,32 +183,45 @@ def update(_):
         buf_bp.append(vf)
         buf_rms.append(vlo)
 
-    if args.score and (time.time() - last_score_t) >= max(0.1, args.score_interval):
-        last_score_t = time.time()
-        rms_list = list(buf_rms)
-        n_cur = max(1, int(args.score_window_sec * FS))
-        n_base = max(1, int(args.score_baseline_sec * FS))
+    # --- Score + event detection (shared computation) ---
+    rms_list = list(buf_rms)
+    n_cur = max(1, int(args.score_window_sec * FS))
+    n_base = max(1, int(args.score_baseline_sec * FS))
 
-        # buf_rms starts pre-filled with zeros; ignore zeros so baseline doesn't start at 0.
-        cur = [x for x in rms_list[-n_cur:] if x > 0]
-        base = [x for x in rms_list[-n_base:] if x > 0]
+    # buf_rms starts pre-filled with zeros; ignore zeros so baseline doesn't start at 0.
+    cur = [x for x in rms_list[-n_cur:] if x > 0]
+    base = [x for x in rms_list[-n_base:] if x > 0]
 
-        # Require enough baseline samples to avoid noisy/meaningless early ratios.
-        if len(base) < min(n_base, int(0.5 * FS)):
-            return lr, lf, lrms
+    # Require enough baseline samples to avoid noisy/meaningless early ratios.
+    baseline_ready = len(base) >= min(n_base, int(0.5 * FS))
 
-        cur_mean = sum(cur) / len(cur)
+    if baseline_ready:
+        cur_mean = sum(cur) / len(cur) if cur else 0.0
         cur_peak = max(cur) if cur else 0.0
         base_med = statistics.median(base) if base else 0.0
         eps = 1e-9
         ratio_mean = cur_mean / max(base_med, eps)
         ratio_peak = cur_peak / max(base_med, eps)
+    else:
+        cur_mean = cur_peak = base_med = ratio_mean = ratio_peak = 0.0
 
+    if args.score and baseline_ready and (time.time() - last_score_t) >= max(0.1, args.score_interval):
+        last_score_t = time.time()
         print(
             f"score cur_mean={cur_mean:.2f} cur_peak={cur_peak:.2f} baseline_med={base_med:.2f} "
             f"ratio_mean={ratio_mean:.2f} ratio_peak={ratio_peak:.2f}",
             flush=True,
         )
+
+    if args.event and baseline_ready:
+        now = time.time()
+        if (ratio_peak >= float(args.event_threshold)) and (now - last_event_t >= float(args.event_min_interval)):
+            event_count += 1
+            last_event_t = now
+            print(
+                f"EVENT {event_count} ratio_peak={ratio_peak:.2f} ratio_mean={ratio_mean:.2f}",
+                flush=True,
+            )
 
     y1=list(buf_raw); y2=list(buf_bp); y3=list(buf_rms)
     lr.set_ydata(y1)
@@ -218,6 +236,7 @@ def update(_):
 
     fig.suptitle(
         f"DRDY=on | input={args.input_mode} | PGA={args.pga} | clip={clip_count} | glitches={glitch_count}"
+        + (f" | events={event_count}" if args.event else "")
         + (" | glitch-reject=off" if args.no_glitch_reject else "")
     )
     return lr, lf, lrms
