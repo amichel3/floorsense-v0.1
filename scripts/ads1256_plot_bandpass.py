@@ -1,19 +1,65 @@
 #!/usr/bin/env python3
-import time, math, collections
+import argparse
+import collections
+import math
+import time
+
 import spidev
+
+try:
+	import RPi.GPIO as GPIO  # type: ignore
+except Exception:
+	GPIO = None
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+
+
+DRDY_PIN_DEFAULT = 17  # BCM (physical pin 11)
+FULL_SCALE_COUNTS = (1 << 23) - 1
+GLITCH_ABS_COUNTS_DEFAULT = int(0.98 * FULL_SCALE_COUNTS)
 
 # ---------- ADS1256 setup (CH1 vs GND on CE0) ----------
 CMD_RESET=0xFE; CMD_WREG=0x50; CMD_RDATA=0x01; CMD_RDATAC=0x03; CMD_SDATAC=0x0F
 CMD_SELFCAL=0xF0; CMD_SYNC=0xFC; CMD_WAKEUP=0x00
 REG_STATUS=0x00; REG_MUX=0x01; REG_ADCON=0x02; REG_DRATE=0x03
 def wr(spi, reg, val): spi.xfer2([CMD_WREG | (reg & 0x0F), 0x00, val]); time.sleep(0.001)
-def to_i24(b):
-	v = (b[0] << 16) | (b[1] << 8) | b[2]
+
+def to_i24(b0, b1=None, b2=None):
+	if b1 is None:
+		b0, b1, b2 = b0
+	v = (b0 << 16) | (b1 << 8) | b2
 	return v - (1<<24) if (v & 0x800000) else v
+
+
+def wait_drdy(drdy_pin, timeout=0.5):
+	if GPIO is None:
+		raise RuntimeError("RPi.GPIO not available; cannot use DRDY mode")
+	t0 = time.time()
+	while time.time() - t0 < timeout:
+		if GPIO.input(drdy_pin) == 0:
+			return
+		time.sleep(0.0002)
+	raise TimeoutError("DRDY timeout")
+
+
+def is_glitch(v, glitch_abs_counts):
+	# Values extremely close to full-scale are often misaligned reads / bad samples.
+	return abs(v) >= glitch_abs_counts
+
+
+parser = argparse.ArgumentParser(description="ADS1256 band-pass plot")
+parser.add_argument("--drdy-pin", type=int, default=DRDY_PIN_DEFAULT, help="BCM pin for DRDY (default: 17)")
+parser.add_argument("--no-drdy", action="store_true", help="Disable DRDY-synchronized reads (fallback to RDATAC)")
+parser.add_argument("--glitch-abs", type=int, default=GLITCH_ABS_COUNTS_DEFAULT, help="Reject samples with abs(counts) >= this")
+args = parser.parse_args()
+
+use_drdy = (not args.no_drdy) and (GPIO is not None)
+
+if use_drdy:
+	GPIO.setmode(GPIO.BCM)
+	GPIO.setup(args.drdy_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 spi = spidev.SpiDev(); spi.open(0,0); spi.max_speed_hz=1_000_000; spi.mode=0b01
 spi.xfer2([CMD_RESET]); time.sleep(0.05); spi.xfer2([CMD_SDATAC]); time.sleep(0.001)
@@ -22,8 +68,13 @@ wr(spi, REG_MUX,    0x18)   # AIN1 vs GND (use 0x08 for AIN0)
 wr(spi, REG_ADCON,  0x00)   # PGA=1
 wr(spi, REG_DRATE,  0xA1)   # ~1 kSPS
 spi.xfer2([CMD_SELFCAL]); time.sleep(0.1); spi.xfer2([CMD_SYNC]); time.sleep(0.001); spi.xfer2([CMD_WAKEUP]); time.sleep(0.001)
-for _ in range(3): spi.xfer2([CMD_RDATA]); time.sleep(0.001); _=spi.readbytes(3)
-spi.xfer2([CMD_RDATAC]); time.sleep(0.001)
+
+# Prime read path
+for _ in range(3):
+	spi.xfer2([CMD_RDATA]); time.sleep(0.001); _ = spi.readbytes(3)
+
+if not use_drdy:
+	spi.xfer2([CMD_RDATAC]); time.sleep(0.001)
 
 # ---------- Band-pass filter (first-order HPF then first-order LPF) ----------
 FS = 1000.0         # samples per second
@@ -66,9 +117,29 @@ ax2.set_xlabel("Samples (last ~2 s)")
 ax2.set_ylabel("Filtered"); ax2.legend(loc="upper left")
 
 CHUNK = 50   # ~50 ms per redraw
+
+last_good = 0
+glitch_count = 0
+
+def read_sample():
+	if use_drdy:
+		wait_drdy(args.drdy_pin)
+		spi.xfer2([CMD_RDATA])
+		time.sleep(0.0005)
+		b = spi.readbytes(3)
+		return to_i24(b)
+	# Fallback: free-running mode
+	return to_i24(spi.readbytes(3))
+
 def update(_):
+	global last_good, glitch_count
 	for _ in range(CHUNK):
-		v = to_i24(spi.readbytes(3))
+		v = read_sample()
+		if is_glitch(v, args.glitch_abs):
+			glitch_count += 1
+			v = last_good
+		else:
+			last_good = v
 		buf_raw.append(v)
 		buf_bp.append(bandpass_step(v))
 
@@ -82,6 +153,7 @@ def update(_):
 		ymin, ymax = min(y), max(y)
 		margin = 0.1*max(1, ymax-ymin)
 		ax.set_ylim(ymin-margin, ymax+margin)
+	fig.suptitle(f"DRDY={'on' if use_drdy else 'off'} | glitches={glitch_count}")
 	ax1.set_xlim(0, len(y1d)-1); ax2.set_xlim(0, len(y1d)-1)
 	return line1, line2
 
@@ -93,3 +165,5 @@ finally:
 	try: spi.xfer2([CMD_SDATAC]); time.sleep(0.001)
 	except Exception: pass
 	spi.close()
+	if use_drdy:
+		GPIO.cleanup()

@@ -55,12 +55,12 @@ def bandpass_step(sample):
 # Detrend raw (center around 0)
 MEAN_WIN = int(0.5*FS)  # 0.5 s moving mean
 from collections import deque
-mwin = deque([], maxlen=MEAN_WIN); msum=0.0
+mwin = deque(); msum=0.0
 def detrend(v):
     global msum
     mwin.append(v); msum += v
-    if len(mwin) == mwin.maxlen:
-        msum -= mwin[0]
+    if len(mwin) > MEAN_WIN:
+        msum -= mwin.popleft()
     mean = msum / len(mwin) if mwin else 0.0
     return v - mean
 
@@ -68,13 +68,13 @@ def detrend(v):
 # Set window between 5–20 ms. Default 10 ms:
 RMS_MS = 10.0
 RMS_N = max(1, int(FS * RMS_MS / 1000.0))
-rwin = deque([], maxlen=RMS_N); rsum_sq = 0.0
+rwin = deque(); rsum_sq = 0.0
 def rms_smooth(x):
     global rsum_sq
     rwin.append(x); rsum_sq += x*x
-    if len(rwin) == rwin.maxlen:
-        # next append will drop oldest; simulate rolling sum now
-        rsum_sq -= rwin[0]*rwin[0]
+    if len(rwin) > RMS_N:
+        old = rwin.popleft()
+        rsum_sq -= old*old
     n = len(rwin) if rwin else 1
     return math.sqrt(max(0.0, rsum_sq) / n)
 
