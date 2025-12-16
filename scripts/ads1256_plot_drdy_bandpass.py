@@ -26,10 +26,11 @@ def to_i24(b0,b1,b2):
     if v & 0x800000: v -= 1<<24
     return v
 
-def wait_drdy(timeout=0.5):
+def wait_drdy(pin: int, timeout=0.5):
     t0=time.time()
     while time.time()-t0 < timeout:
-        if GPIO.input(DRDY_PIN)==0: return
+        if GPIO.input(pin)==0:
+            return
         time.sleep(0.0002)
     raise TimeoutError("DRDY timeout")
 
@@ -135,7 +136,7 @@ lrms,= ax2.plot(range(N), list(buf_rms),lw=1.6, color="#ff7f0e", label=f"RMS {in
 ax2.set_xlabel("Samples (last ~2 s)"); ax2.set_ylabel("Filtered"); ax2.legend(loc="upper left")
 
 def read_sample():
-    wait_drdy()
+    wait_drdy(args.drdy_pin)
     s.xfer2([0x01])       # CMD_RDATA
     time.sleep(0.0005)    # t6 settle
     b0,b1,b2 = s.readbytes(3)
