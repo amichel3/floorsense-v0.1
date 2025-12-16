@@ -184,16 +184,24 @@ def update(_):
         n_cur = max(1, int(args.score_window_sec * FS))
         n_base = max(1, int(args.score_baseline_sec * FS))
 
-        cur = rms_list[-n_cur:]
-        base = rms_list[-n_base:]
+        # buf_rms starts pre-filled with zeros; ignore zeros so baseline doesn't start at 0.
+        cur = [x for x in rms_list[-n_cur:] if x > 0]
+        base = [x for x in rms_list[-n_base:] if x > 0]
+
+        # Require enough baseline samples to avoid noisy/meaningless early ratios.
+        if len(base) < min(n_base, int(0.5 * FS)):
+            return lr, lf, lrms
 
         cur_mean = sum(cur) / len(cur)
         cur_peak = max(cur) if cur else 0.0
         base_med = statistics.median(base) if base else 0.0
-        ratio = (cur_mean / base_med) if base_med > 0 else float('inf')
+        eps = 1e-9
+        ratio_mean = cur_mean / max(base_med, eps)
+        ratio_peak = cur_peak / max(base_med, eps)
 
         print(
-            f"score cur_mean={cur_mean:.2f} cur_peak={cur_peak:.2f} baseline_med={base_med:.2f} ratio={ratio:.2f}",
+            f"score cur_mean={cur_mean:.2f} cur_peak={cur_peak:.2f} baseline_med={base_med:.2f} "
+            f"ratio_mean={ratio_mean:.2f} ratio_peak={ratio_peak:.2f}",
             flush=True,
         )
 
